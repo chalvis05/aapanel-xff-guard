@@ -2,7 +2,7 @@
     "title": "XFF Guard",
     "name": "xff_guard",
     "ps": "Stops X-Forwarded-For spoofing (e.g. 127.x.x.x) behind Cloudflare / Cloudflare Tunnel / proxies. Works on aaPanel Free (no WAF needed) and with the Pro Nginx WAF",
-    "versions": "1.1.2",
+    "versions": "1.1.3",
     "checks": "/www/server/panel/plugin/xff_guard",
     "author": "chalvis05",
     "home": "https://www.alvisgames.com",
@@ -18,5 +18,5 @@
     "mutex": "",
     "install_checks": "/www/server/panel/plugin/xff_guard/xff_guard_main.py",
     "uninsatll_checks": "/www/server/panel/plugin/xff_guard",
-    "update": "1.1.2"
+    "update": "1.1.3"
 }

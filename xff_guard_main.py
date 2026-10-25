@@ -40,6 +40,10 @@ try:
 except ImportError:  # python 2 panels
     from urllib2 import urlopen
 
+# Must match UI_VERSION in index.html. The panel keeps plugin modules in memory,
+# so after an update the page can talk to the previous backend until a restart.
+PLUGIN_VERSION = '1.1.3'
+
 PANEL_PATH = '/www/server/panel'
 if os.path.isdir(PANEL_PATH + '/class'):
     sys.path.insert(0, PANEL_PATH + '/class')
@@ -499,6 +503,7 @@ log_format xff_guard '$time_local $remote_addr "$http_x_forwarded_for" $host "$r
             if btwaf_installed else {'path': None, 'error': '', 'sites': []}
         site_files = safe('site configs', self.__site_files, [])
         return _ret(True, 'ok', {
+            'version': PLUGIN_VERSION,
             'config': conf,
             'nginx': info,
             'active': os.path.exists(GUARD_CONF),

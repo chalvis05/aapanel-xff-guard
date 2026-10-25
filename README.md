@@ -71,6 +71,16 @@ IP, not `127.4.4.1`.
 
 ## Troubleshooting
 
+### After updating: page errors, empty tabs or "older XFF Guard backend"
+
+aaPanel keeps a plugin's Python code in memory. After importing a new zip,
+the panel shows the new page but keeps running the old backend until it
+restarts. Restart the panel, then reopen XFF Guard:
+
+```bash
+/etc/init.d/bt restart
+```
+
 ### Apply fails: `"real_ip_header" directive is duplicate`
 
 aaPanel's own CDN real-IP option writes
