@@ -84,8 +84,8 @@
         <p>The aaPanel WAF "CDN" option takes the client IP from the <b>left-most</b> X-Forwarded-For value,
            which the attacker controls (<code>127.4.4.1,203.0.113.50</code> → <code>127.4.4.1</code>).
            With XFF Guard active, nginx already knows the real IP, so CDN mode should be off.</p>
-        <div id="xffg-waf"></div>
-        <button class="btn btn-success btn-sm" id="xffg-wafbtn" style="margin-top:10px" onclick="xffg.call('fix_btwaf')">Turn off CDN header mode on all sites</button>
+        <div id="xffg-waf"><p class="tip">Loading sites…</p></div>
+        <button class="btn btn-success btn-sm" id="xffg-wafbtn" style="margin-top:10px;display:none" onclick="xffg.call('fix_btwaf')">Turn off CDN header mode on all sites</button>
     </div>
 
     <div class="pane" id="p-conf">
@@ -108,12 +108,24 @@
 
 <script type="text/javascript">
 var xffg = {
-    req: function (method, args, cb) {
+    req: function (method, args, cb, onFail) {
         var idx = layer.msg('Working...', { icon: 16, time: 0, shade: 0.3 });
         $.post('/plugin?action=a&name=xff_guard&s=' + method, args || {}, function (r) {
             layer.close(idx);
             cb && cb(r);
-        }, 'json').fail(function () { layer.close(idx); layer.msg('Request failed', { icon: 2 }); });
+        }, 'json').fail(function (xhr) {
+            layer.close(idx);
+            // the panel answers a plugin crash with an HTML/text traceback, not JSON
+            var text = $('<div>').html(xhr.responseText || '').text().replace(/\s+\n/g, '\n').trim().slice(-1500);
+            var msg = 'Request failed (HTTP ' + xhr.status + ')' + (text ? ':\n' + text : '');
+            if (onFail) onFail(msg); else layer.msg(xffg.esc(msg).replace(/\n/g, '<br>'), { icon: 2, time: 0, closeBtn: 2 });
+        });
+    },
+    showError: function (msg) {
+        var html = '<div class="warn"><b>Could not load plugin status.</b><pre>' + xffg.esc(msg) + '</pre></div>';
+        $('#xffg-warn').html(html);
+        $('#xffg-waf').html(html);
+        $('#xffg-wafbtn').hide();
     },
     call: function (method) {
         xffg.req(method, {}, function (r) {
@@ -130,8 +142,12 @@ var xffg = {
     },
     load: function () {
         xffg.req('get_status', {}, function (r) {
-            if (!r.status) return layer.msg(r.msg, { icon: 2 });
-            var d = r.data, c = d.config, n = d.nginx;
+            if (!r || !r.status || !r.data) return xffg.showError((r && r.msg) || 'Empty response from get_status');
+            try { xffg.render(r.data); } catch (e) { xffg.showError('Page error: ' + e.message); }
+        }, xffg.showError);
+    },
+    render: function (d) {
+            var c = d.config, n = d.nginx;
             $('#xffg-state').html(d.active ? '<span class="badge on">Protected</span>' : '<span class="badge off">Not active</span>');
             $('#xffg-last').text(c.last_apply ? 'Last apply ' + c.last_apply + ' — ' + c.last_result : '');
             $('#xffg-nginx').html(!n.installed ? '<span class="badge bad">Not installed</span>' :
@@ -182,19 +198,23 @@ var xffg = {
             xffg.foreign = d.foreign_realip;
             if (c.last_error)
                 w += '<div class="warn"><b>Last apply failed. nginx -t said:</b><pre>' + xffg.esc(c.last_error) + '</pre></div>';
+            if (d.errors && d.errors.length)
+                w += '<div class="warn"><b>Some checks could not run:</b><pre>' + xffg.esc(d.errors.join('\n')) + '</pre></div>';
             $('#xffg-warn').html(w);
 
-            var t;
-            $('#xffg-wafbtn').toggle(!!d.btwaf_sites);
+            var t, sites = d.btwaf_sites || [];
+            $('#xffg-wafbtn').toggle(sites.length > 0);
             if (!d.btwaf_installed) t = '<p><b>Nginx WAF (Pro) is not installed: nothing to do here.</b> On aaPanel Free, ' +
                 'XFF Guard alone fixes the client IP for PHP apps, IP allow/deny rules, rate limits and logs.</p>';
-            else if (!d.btwaf_sites) t = '<p>Could not read /www/server/btwaf/site.json.</p>';
+            else if (d.btwaf_error) t = '<div class="warn"><b>Could not read the WAF site list.</b><pre>' + xffg.esc(d.btwaf_error) + '</pre></div>';
+            else if (!sites.length) t = '<p>The WAF is installed but <code>' + xffg.esc(d.btwaf_path) +
+                '</code> lists no sites. Add your sites in the Nginx WAF app first.</p>';
             else {
-                var spoofable = $.grep(d.btwaf_sites, function (s) { return s.cdn; }).length;
-                t = '<p>' + d.btwaf_sites.length + ' site(s), <b' + (spoofable ? ' style="color:#e74c3c"' : '') + '>' +
+                var spoofable = $.grep(sites, function (s) { return s.cdn; }).length;
+                t = '<p>' + sites.length + ' site(s) in <code>' + xffg.esc(d.btwaf_path) + '</code>, <b' + (spoofable ? ' style="color:#e74c3c"' : '') + '>' +
                     spoofable + ' spoofable</b></p>' +
                     '<div class="scroll"><table class="table table-hover"><thead><tr><th>Site</th><th>CDN header mode</th><th>Headers read</th></tr></thead><tbody>';
-                $.each(d.btwaf_sites, function (i, s) {
+                $.each(sites, function (i, s) {
                     t += '<tr><td>' + xffg.esc(s.name) + '</td><td>' +
                          (s.cdn ? '<span class="badge bad">ON (spoofable)</span>' : '<span class="badge on">off</span>') +
                          '</td><td>' + xffg.esc([].concat(s.cdn_header || []).join(', ')) + '</td></tr>';
@@ -203,7 +223,6 @@ var xffg = {
             }
             $('#xffg-waf').html(t);
             xffg.toggle();
-        });
     },
     save: function () {
         xffg.req('save_config', {

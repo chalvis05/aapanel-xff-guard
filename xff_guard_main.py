@@ -25,6 +25,7 @@
 # |   3. Optional: log or block requests that carried a spoofed
 # |      private/loopback address in X-Forwarded-For.
 # +-------------------------------------------------------------------
+import io
 import os
 import re
 import sys
@@ -121,16 +122,22 @@ def _run(cmd):
     return p.returncode, out
 
 
+# aaPanel configs carry Chinese comments and sometimes GBK bytes, and the panel
+# may run under a non-UTF-8 locale. Read as UTF-8, round-trip any invalid bytes
+# untouched (surrogateescape), and keep the file's own line endings.
+_ENC_ERRORS = 'surrogateescape' if sys.version_info[0] >= 3 else 'ignore'
+
+
 def _read(path):
-    if not os.path.exists(path):
+    if not os.path.isfile(path):
         return None
-    with open(path, 'r') as f:
+    with io.open(path, 'r', encoding='utf-8', errors=_ENC_ERRORS, newline='') as f:
         return f.read()
 
 
 def _write(path, body):
     tmp = path + '.tmp'
-    with open(tmp, 'w') as f:
+    with io.open(tmp, 'w', encoding='utf-8', errors=_ENC_ERRORS, newline='') as f:
         f.write(body)
     if os.path.exists(path):
         shutil.copymode(path, tmp)
@@ -197,25 +204,56 @@ class xff_guard_main:
             hits.append({'file': f, 'body': body[:4000], 'takeover': f != NGINX_CONF})
         return hits
 
-    def __btwaf_sites(self):
-        """List btwaf sites that read the client IP from a CDN header (the vulnerable path)."""
-        raw = _read(BTWAF_SITE_JSON)
-        if raw is None:
-            return None
+    def __btwaf_path(self):
+        """site.json location differs between WAF versions."""
+        if os.path.isfile(BTWAF_SITE_JSON):
+            return BTWAF_SITE_JSON
+        for root, dirs, names in os.walk(BTWAF_PATH):
+            if root.count(os.sep) - BTWAF_PATH.count(os.sep) >= 2:
+                del dirs[:]
+            if 'site.json' in names:
+                return os.path.join(root, 'site.json')
+        return None
+
+    def __btwaf_load(self):
+        """
+        Returns (path, data, entries, error). entries is a list of (name, cfg) where
+        cfg is the live dict inside data, so changes to it can be saved back.
+        Accepts {"site": {...}} and [{"name"/"siteName": "site", ...}] layouts.
+        """
+        path = self.__btwaf_path()
+        if path is None:
+            return None, None, [], 'site.json not found under %s' % BTWAF_PATH
         try:
-            sites = json.loads(raw)
-        except Exception:
-            return None
-        result = []
-        for name, cfg in sites.items():
-            if not isinstance(cfg, dict):
-                continue
-            result.append({
+            data = json.loads(_read(path) or '')
+        except Exception as e:
+            return path, None, [], 'Could not parse %s: %s' % (path, e)
+        entries = []
+        if isinstance(data, dict):
+            entries = [(k, v) for k, v in data.items() if isinstance(v, dict)]
+        elif isinstance(data, list):
+            for i, v in enumerate(data):
+                if isinstance(v, dict):
+                    entries.append((v.get('name') or v.get('siteName') or v.get('site') or 'site #%d' % (i + 1), v))
+        return path, data, entries, ''
+
+    @staticmethod
+    def __truthy(v):
+        return v is True or (isinstance(v, (int, float)) and v != 0) or \
+            (isinstance(v, str) and v.strip().lower() in ('1', 'true', 'on', 'yes', 'open'))
+
+    def __btwaf_sites(self):
+        """btwaf sites and whether they read the client IP from a CDN header (the vulnerable path)."""
+        path, _, entries, error = self.__btwaf_load()
+        sites = []
+        for name, cfg in entries:
+            header = cfg.get('cdn_header', [])
+            sites.append({
                 'name': name,
-                'cdn': bool(cfg.get('cdn', False)),
-                'cdn_header': cfg.get('cdn_header', []),
+                'cdn': self.__truthy(cfg.get('cdn', False)),
+                'cdn_header': header if isinstance(header, list) else [header],
             })
-        return result
+        return {'path': path, 'error': error, 'sites': sites}
 
     def __site_files(self):
         """aaPanel site vhosts: http-level *.conf files that contain a server block."""
@@ -444,24 +482,39 @@ log_format xff_guard '$time_local $remote_addr "$http_x_forwarded_for" $host "$r
 
     # ============================================================ panel API
     def get_status(self, get):
-        conf = self.__load()
-        info = self.__nginx_info()
-        sites = self.__btwaf_sites()
-        site_files = self.__site_files()
+        # Each section is isolated: one unreadable file must not blank the whole page.
+        errors = []
+
+        def safe(label, fn, default):
+            try:
+                return fn()
+            except Exception as e:
+                errors.append('%s: %s: %s' % (label, type(e).__name__, e))
+                return default
+
+        conf = safe('config', self.__load, dict(DEFAULT_CONFIG))
+        info = safe('nginx', self.__nginx_info, {'installed': False, 'realip': False, 'lua': False, 'version': ''})
+        btwaf_installed = os.path.isdir(BTWAF_PATH)
+        waf = safe('WAF sites', self.__btwaf_sites, {'path': None, 'error': 'read failed', 'sites': []}) \
+            if btwaf_installed else {'path': None, 'error': '', 'sites': []}
+        site_files = safe('site configs', self.__site_files, [])
         return _ret(True, 'ok', {
             'config': conf,
             'nginx': info,
             'active': os.path.exists(GUARD_CONF),
-            'conf_preview': _read(GUARD_CONF) or '',
-            'snippet_preview': _read(SERVER_SNIPPET) or '',
-            'trusted_count': len(self.__trusted(conf)),
-            'foreign_realip': self.__foreign_realip(),
-            'btwaf_installed': os.path.isdir(BTWAF_PATH),
-            'btwaf_sites': sites,
-            'vulnerable_sites': [s['name'] for s in (sites or []) if s['cdn']],
+            'conf_preview': safe('guard conf', lambda: _read(GUARD_CONF) or '', ''),
+            'snippet_preview': safe('site snippet', lambda: _read(SERVER_SNIPPET) or '', ''),
+            'trusted_count': safe('trusted', lambda: len(self.__trusted(conf)), 0),
+            'foreign_realip': safe('real-IP scan', self.__foreign_realip, []),
+            'btwaf_installed': btwaf_installed,
+            'btwaf_path': waf['path'],
+            'btwaf_error': waf['error'],
+            'btwaf_sites': waf['sites'],
+            'vulnerable_sites': [s['name'] for s in waf['sites'] if s['cdn']],
             'sites_total': len(site_files),
-            'sites_guarded': len([f for f in site_files if MARK in (_read(f) or '')]),
-            'proxy_spoofable': self.__proxy_files(),
+            'sites_guarded': safe('site coverage', lambda: len([f for f in site_files if MARK in (_read(f) or '')]), 0),
+            'proxy_spoofable': safe('reverse-proxy scan', self.__proxy_files, []),
+            'errors': errors,
         })
 
     def save_config(self, get):
@@ -655,25 +708,24 @@ log_format xff_guard '$time_local $remote_addr "$http_x_forwarded_for" $host "$r
         """
         if not os.path.exists(GUARD_CONF):
             return _ret(False, 'Enable protection first, otherwise the WAF would see the proxy IP')
-        raw = _read(BTWAF_SITE_JSON)
-        if raw is None:
-            return _ret(False, 'btwaf site.json not found at %s' % BTWAF_SITE_JSON)
-        try:
-            sites = json.loads(raw)
-        except Exception:
-            return _ret(False, 'Could not parse btwaf site.json')
-        if not os.path.isdir(BACKUP_PATH):
-            os.makedirs(BACKUP_PATH)
-        backup = os.path.join(BACKUP_PATH, 'site.json.%s' % time.strftime('%Y%m%d%H%M%S'))
-        shutil.copy2(BTWAF_SITE_JSON, backup)
+        path, data, entries, error = self.__btwaf_load()
+        if error:
+            return _ret(False, error)
         changed = []
-        for name, cfg in sites.items():
-            if isinstance(cfg, dict) and cfg.get('cdn'):
-                cfg['cdn'] = False
+        for name, cfg in entries:
+            v = cfg.get('cdn', False)
+            if self.__truthy(v):
+                # keep the WAF's own value type
+                cfg['cdn'] = 0 if isinstance(v, (int, float)) and not isinstance(v, bool) else \
+                    ('false' if isinstance(v, str) else False)
                 changed.append(name)
         if not changed:
             return _ret(True, 'No btwaf site uses CDN header mode, nothing to change')
-        _write(BTWAF_SITE_JSON, json.dumps(sites))
+        if not os.path.isdir(BACKUP_PATH):
+            os.makedirs(BACKUP_PATH)
+        backup = os.path.join(BACKUP_PATH, 'site.json.%s' % time.strftime('%Y%m%d%H%M%S'))
+        shutil.copy2(path, backup)
+        _write(path, json.dumps(data))
         self.__nginx_reload()
         return _ret(True, 'Disabled CDN header mode for: %s (backup: %s)' % (', '.join(changed), backup))
 
