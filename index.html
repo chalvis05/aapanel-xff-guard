@@ -12,6 +12,9 @@
     #xffg .tabs span { display: inline-block; padding: 6px 14px; cursor: pointer; border-bottom: 2px solid transparent; }
     #xffg .tabs span.act { border-color: #20a53a; color: #20a53a; }
     #xffg .pane { display: none; } #xffg .pane.act { display: block; }
+    #xffg .scroll { max-height: 300px; overflow-y: auto; border: 1px solid #eee; }
+    #xffg .scroll table { margin: 0; }
+    #xffg .scroll thead th { position: sticky; top: 0; background: #f6f8fa; z-index: 1; }
 </style>
 
 <div id="xffg">
@@ -187,13 +190,16 @@ var xffg = {
                 'XFF Guard alone fixes the client IP for PHP apps, IP allow/deny rules, rate limits and logs.</p>';
             else if (!d.btwaf_sites) t = '<p>Could not read /www/server/btwaf/site.json.</p>';
             else {
-                t = '<table class="table table-hover"><thead><tr><th>Site</th><th>CDN header mode</th><th>Headers read</th></tr></thead><tbody>';
+                var spoofable = $.grep(d.btwaf_sites, function (s) { return s.cdn; }).length;
+                t = '<p>' + d.btwaf_sites.length + ' site(s), <b' + (spoofable ? ' style="color:#e74c3c"' : '') + '>' +
+                    spoofable + ' spoofable</b></p>' +
+                    '<div class="scroll"><table class="table table-hover"><thead><tr><th>Site</th><th>CDN header mode</th><th>Headers read</th></tr></thead><tbody>';
                 $.each(d.btwaf_sites, function (i, s) {
                     t += '<tr><td>' + xffg.esc(s.name) + '</td><td>' +
                          (s.cdn ? '<span class="badge bad">ON (spoofable)</span>' : '<span class="badge on">off</span>') +
                          '</td><td>' + xffg.esc([].concat(s.cdn_header || []).join(', ')) + '</td></tr>';
                 });
-                t += '</tbody></table>';
+                t += '</tbody></table></div>';
             }
             $('#xffg-waf').html(t);
             xffg.toggle();
