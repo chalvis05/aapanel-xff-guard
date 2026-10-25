@@ -1,0 +1,22 @@
+{
+    "title": "XFF Guard",
+    "name": "xff_guard",
+    "ps": "Stops X-Forwarded-For spoofing (e.g. 127.x.x.x) from bypassing the Nginx WAF behind Cloudflare / Cloudflare Tunnel / proxies",
+    "versions": "1.0",
+    "checks": "/www/server/panel/plugin/xff_guard",
+    "author": "chalvis05",
+    "home": "https://www.example.com",
+    "date": "2026-10-25",
+    "default": false,
+    "display": 1,
+    "type": 0,
+    "pid": 0,
+    "id": 0,
+    "price": 0,
+    "tip": "lib",
+    "dependnet": "",
+    "mutex": "",
+    "install_checks": "/www/server/panel/plugin/xff_guard/xff_guard_main.py",
+    "uninsatll_checks": "/www/server/panel/plugin/xff_guard",
+    "update": "1.0"
+}

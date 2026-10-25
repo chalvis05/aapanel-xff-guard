@@ -1,0 +1,210 @@
+<style>
+    #xffg { padding: 15px 20px; font-size: 12px; color: #555; }
+    #xffg h3 { font-size: 14px; margin: 14px 0 8px; color: #333; }
+    #xffg .row { display: flex; align-items: center; margin-bottom: 10px; }
+    #xffg .row label.k { width: 150px; flex: none; color: #666; }
+    #xffg .badge { display: inline-block; padding: 2px 8px; border-radius: 3px; color: #fff; font-size: 12px; }
+    #xffg .on { background: #20a53a; } #xffg .off { background: #999; } #xffg .bad { background: #e74c3c; }
+    #xffg .warn { background: #fff7e6; border: 1px solid #ffd591; padding: 8px 10px; margin-bottom: 10px; border-radius: 3px; }
+    #xffg .tip { color: #999; margin-left: 8px; }
+    #xffg pre { background: #f6f8fa; border: 1px solid #eee; padding: 10px; max-height: 220px; overflow: auto; font-size: 11px; white-space: pre-wrap; }
+    #xffg textarea { width: 330px; height: 70px; font-family: monospace; }
+    #xffg .tabs span { display: inline-block; padding: 6px 14px; cursor: pointer; border-bottom: 2px solid transparent; }
+    #xffg .tabs span.act { border-color: #20a53a; color: #20a53a; }
+    #xffg .pane { display: none; } #xffg .pane.act { display: block; }
+</style>
+
+<div id="xffg">
+    <div class="tabs">
+        <span class="act" data-p="p-main">Protection</span>
+        <span data-p="p-waf">WAF audit</span>
+        <span data-p="p-conf">Nginx config</span>
+        <span data-p="p-log">Spoof log</span>
+    </div>
+
+    <div class="pane act" id="p-main">
+        <div id="xffg-warn"></div>
+        <div class="row"><label class="k">Status</label><span id="xffg-state"></span><span class="tip" id="xffg-last"></span></div>
+        <div class="row"><label class="k">Nginx</label><span id="xffg-nginx"></span></div>
+
+        <h3>Where does traffic come from?</h3>
+        <div class="row"><label class="k">Proxy mode</label>
+            <select id="xffg-mode" class="bt-input-text">
+                <option value="cloudflare">Cloudflare (proxy or Tunnel)</option>
+                <option value="custom">Custom proxy / load balancer</option>
+                <option value="direct">No proxy (clients connect directly)</option>
+            </select>
+        </div>
+        <div class="row" id="xffg-custom-row"><label class="k">Trusted proxy IPs</label>
+            <textarea id="xffg-custom" class="bt-input-text" placeholder="One IP or CIDR per line"></textarea>
+        </div>
+        <div class="row xffg-proxy"><label class="k">Client IP header</label>
+            <select id="xffg-header" class="bt-input-text">
+                <option>CF-Connecting-IP</option><option>True-Client-IP</option>
+                <option>X-Real-IP</option><option>X-Forwarded-For</option>
+            </select>
+            <span class="tip">Read only when the request comes from a trusted proxy</span>
+        </div>
+        <div class="row xffg-proxy"><label class="k">Trust 127.0.0.1 / ::1</label>
+            <input type="checkbox" id="xffg-loop">
+            <span class="tip">Needed for Cloudflare Tunnel (cloudflared connects from localhost)</span>
+        </div>
+
+        <h3>Header guard</h3>
+        <div class="row"><label class="k">Rewrite XFF before WAF</label>
+            <input type="checkbox" id="xffg-lua">
+            <span class="tip">Replaces X-Forwarded-For / X-Real-IP with the verified IP (needs Lua)</span>
+        </div>
+        <div class="row"><label class="k">Spoofed private IP in XFF</label>
+            <select id="xffg-action" class="bt-input-text">
+                <option value="log">Log only</option>
+                <option value="block">Block (403)</option>
+                <option value="off">Ignore</option>
+            </select>
+        </div>
+        <div class="row xffg-cf"><label class="k">Cloudflare ranges</label>
+            <span id="xffg-cf"></span>
+            <button class="btn btn-default btn-xs" style="margin-left:10px" onclick="xffg.call('update_cloudflare')">Update now</button>
+        </div>
+
+        <div style="margin-top:16px">
+            <button class="btn btn-success btn-sm" onclick="xffg.save()">Save &amp; apply</button>
+            <button class="btn btn-default btn-sm" onclick="xffg.call('disable')">Disable</button>
+        </div>
+    </div>
+
+    <div class="pane" id="p-waf">
+        <p>The aaPanel WAF "CDN" option takes the client IP from the <b>left-most</b> X-Forwarded-For value,
+           which the attacker controls (<code>127.4.4.1,203.0.113.50</code> → <code>127.4.4.1</code>).
+           With XFF Guard active, nginx already knows the real IP, so CDN mode should be off.</p>
+        <div id="xffg-waf"></div>
+        <button class="btn btn-success btn-sm" style="margin-top:10px" onclick="xffg.call('fix_btwaf')">Turn off CDN header mode on all sites</button>
+    </div>
+
+    <div class="pane" id="p-conf">
+        <p>Written to <code>/www/server/panel/vhost/nginx/0.xff_guard.conf</code> (http level).</p>
+        <pre id="xffg-conf"></pre>
+    </div>
+
+    <div class="pane" id="p-log">
+        <p>Spoof attempts from <code>/www/wwwlogs/nginx_error.log</code> (newest first).
+           <button class="btn btn-default btn-xs" onclick="xffg.logs()">Refresh</button></p>
+        <pre id="xffg-log">-</pre>
+    </div>
+</div>
+
+<script type="text/javascript">
+var xffg = {
+    req: function (method, args, cb) {
+        var idx = layer.msg('Working...', { icon: 16, time: 0, shade: 0.3 });
+        $.post('/plugin?action=a&name=xff_guard&s=' + method, args || {}, function (r) {
+            layer.close(idx);
+            cb && cb(r);
+        }, 'json').fail(function () { layer.close(idx); layer.msg('Request failed', { icon: 2 }); });
+    },
+    call: function (method) {
+        xffg.req(method, {}, function (r) {
+            layer.msg((r.msg || '').replace(/\n/g, '<br>'), { icon: r.status ? 1 : 2, time: r.status ? 2500 : 0, closeBtn: 2 });
+            xffg.load();
+        });
+    },
+    esc: function (s) { return $('<div>').text(s == null ? '' : s).html(); },
+    toggle: function () {
+        var m = $('#xffg-mode').val();
+        $('#xffg-custom-row').toggle(m === 'custom');
+        $('.xffg-proxy').toggle(m !== 'direct');
+        $('.xffg-cf').toggle(m === 'cloudflare');
+    },
+    load: function () {
+        xffg.req('get_status', {}, function (r) {
+            if (!r.status) return layer.msg(r.msg, { icon: 2 });
+            var d = r.data, c = d.config, n = d.nginx;
+            $('#xffg-state').html(d.active ? '<span class="badge on">Protected</span>' : '<span class="badge off">Not active</span>');
+            $('#xffg-last').text(c.last_apply ? 'Last apply ' + c.last_apply + ' — ' + c.last_result : '');
+            $('#xffg-nginx').html(!n.installed ? '<span class="badge bad">Not installed</span>' :
+                xffg.esc(n.version) + ' &nbsp; realip: ' + (n.realip ? 'yes' : '<b style="color:#e74c3c">no</b>') +
+                ' &nbsp; Lua: ' + (n.lua ? 'yes' : 'no'));
+            $('#xffg-mode').val(c.mode);
+            $('#xffg-custom').val((c.custom_proxies || []).join('\n'));
+            $('#xffg-header').val(c.real_ip_header);
+            $('#xffg-loop').prop('checked', !!c.trust_loopback);
+            $('#xffg-lua').prop('checked', !!c.lua_guard);
+            $('#xffg-action').val(c.spoof_action);
+            $('#xffg-cf').text((c.cf_ranges || []).length + ' ranges' +
+                (c.cf_updated ? ', updated ' + new Date(c.cf_updated * 1000).toLocaleString() : ' (built-in list)'));
+            $('#xffg-conf').text(d.conf_preview || '(not written yet)');
+
+            var w = '';
+            if (d.vulnerable_sites.length)
+                w += '<div class="warn"><b>Bypassable:</b> WAF CDN header mode is on for ' +
+                     xffg.esc(d.vulnerable_sites.join(', ')) + '. See the WAF audit tab.</div>';
+            $.each(d.foreign_realip, function (i, f) {
+                w += '<div class="warn"><b>' + xffg.esc(f.file) + '</b> already sets the real IP at http level, ' +
+                     'so nginx rejects a second real_ip_header. ' +
+                     (/0\.0\.0\.0\/0|::\/0/.test(f.body) ? '<b style="color:#e74c3c">It trusts every IP (0.0.0.0/0), ' +
+                     'which lets anyone fake their IP: this file is likely the cause of the bypass.</b> ' : '') +
+                     '<pre>' + xffg.esc(f.body) + '</pre>' +
+                     (f.takeover ? '<button class="btn btn-success btn-xs" onclick="xffg.takeover(' + i + ')">' +
+                     'Replace it with XFF Guard</button> <span class="tip">Renamed and backed up; Disable restores it</span>'
+                     : 'Edit nginx.conf and remove these lines by hand.') + '</div>';
+            });
+            xffg.foreign = d.foreign_realip;
+            if (c.last_error)
+                w += '<div class="warn"><b>Last apply failed. nginx -t said:</b><pre>' + xffg.esc(c.last_error) + '</pre></div>';
+            $('#xffg-warn').html(w);
+
+            var t;
+            if (!d.btwaf_installed) t = '<p>aaPanel Nginx WAF (btwaf) not found.</p>';
+            else if (!d.btwaf_sites) t = '<p>Could not read /www/server/btwaf/site.json.</p>';
+            else {
+                t = '<table class="table table-hover"><thead><tr><th>Site</th><th>CDN header mode</th><th>Headers read</th></tr></thead><tbody>';
+                $.each(d.btwaf_sites, function (i, s) {
+                    t += '<tr><td>' + xffg.esc(s.name) + '</td><td>' +
+                         (s.cdn ? '<span class="badge bad">ON (spoofable)</span>' : '<span class="badge on">off</span>') +
+                         '</td><td>' + xffg.esc([].concat(s.cdn_header || []).join(', ')) + '</td></tr>';
+                });
+                t += '</tbody></table>';
+            }
+            $('#xffg-waf').html(t);
+            xffg.toggle();
+        });
+    },
+    save: function () {
+        xffg.req('save_config', {
+            mode: $('#xffg-mode').val(),
+            custom_proxies: $('#xffg-custom').val(),
+            real_ip_header: $('#xffg-header').val(),
+            trust_loopback: $('#xffg-loop').prop('checked') ? 1 : 0,
+            lua_guard: $('#xffg-lua').prop('checked') ? 1 : 0,
+            spoof_action: $('#xffg-action').val()
+        }, function (r) {
+            if (!r.status) return layer.msg((r.msg || '').replace(/\n/g, '<br>'), { icon: 2, time: 0, closeBtn: 2 });
+            if (r.msg === 'Settings saved') return xffg.call('apply');
+            layer.msg(r.msg, { icon: 1 });
+            xffg.load();
+        });
+    },
+    takeover: function (i) {
+        var f = xffg.foreign[i].file;
+        layer.confirm('Disable ' + xffg.esc(f) + ' and let XFF Guard set the real IP?', { title: 'Replace real-IP config' }, function (ix) {
+            layer.close(ix);
+            xffg.req('takeover', { file: f }, function (r) {
+                layer.msg((r.msg || '').replace(/\n/g, '<br>'), { icon: r.status ? 1 : 2, time: r.status ? 3000 : 0, closeBtn: 2 });
+                xffg.load();
+            });
+        });
+    },
+    logs: function () {
+        xffg.req('get_logs', {}, function (r) { $('#xffg-log').text((r.data || []).join('\n') || 'No spoof attempts logged.'); });
+    }
+};
+
+$('#xffg .tabs span').click(function () {
+    $(this).addClass('act').siblings().removeClass('act');
+    $('#xffg .pane').removeClass('act');
+    $('#' + $(this).data('p')).addClass('act');
+    if ($(this).data('p') === 'p-log') xffg.logs();
+});
+$('#xffg-mode').change(xffg.toggle);
+xffg.load();
+</script>
