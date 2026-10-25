@@ -52,3 +52,34 @@ curl -s -H 'X-Forwarded-For: 127.4.4.1' https://www.example.com/.env -o /dev/nul
 
 This should now be blocked by the WAF (or by XFF Guard, if set to Block).
 In the WAF log, the client IP should be your real IP, not `127.4.4.1`.
+
+## Troubleshooting
+
+### Apply fails: `"real_ip_header" directive is duplicate`
+
+aaPanel's own CDN real-IP option writes
+`/www/server/panel/vhost/nginx/real_cdn_ip.conf`, which already sets
+`real_ip_header` at http level, so nginx rejects the second one from XFF Guard.
+That file often trusts every IP (`set_real_ip_from 0.0.0.0/0;`), which is
+itself enough to let a spoofed `X-Forwarded-For` through.
+
+Move it out of the nginx include folder (this keeps a backup):
+
+```bash
+mv /www/server/panel/vhost/nginx/real_cdn_ip.conf /root/real_cdn_ip.conf.bak
+```
+
+Then open XFF Guard and click **Save & apply** again. The plugin's
+**Replace it with XFF Guard** button does the same thing for you.
+
+If aaPanel's CDN real-IP setting is still on, it may write the file again;
+turn that setting off. To undo, click **Disable** in XFF Guard first (otherwise
+the duplicate comes back), then move the backup back and reload nginx:
+
+```bash
+mv /root/real_cdn_ip.conf.bak /www/server/panel/vhost/nginx/real_cdn_ip.conf
+```
+
+```bash
+/etc/init.d/nginx reload
+```
