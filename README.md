@@ -1,6 +1,7 @@
 # XFF Guard (aaPanel third-party plugin)
 
-Fixes the X-Forwarded-For bypass of the aaPanel Nginx WAF (btwaf).
+Fixes X-Forwarded-For spoofing on aaPanel nginx. Works on **aaPanel Free**
+(no WAF needed) and with the **Pro Nginx WAF** (btwaf).
 
 ## The bypass
 
@@ -12,10 +13,11 @@ cf-warp-tag-id: ...            <- request arrived through Cloudflare Tunnel
 ```
 
 The attacker sends `X-Forwarded-For: 127.4.4.1`. Cloudflare appends the real
-address, so the origin gets `127.4.4.1,203.0.113.50`. The WAF's CDN mode takes
-the left-most value, so it sees `127.4.4.1`: a loopback address that is
-whitelisted. Through Cloudflare Tunnel, `$remote_addr` is `127.0.0.1`
-as well, so the WAF never sees the real client.
+address, so the origin gets `127.4.4.1,203.0.113.50`. Anything that trusts the
+left-most value sees `127.4.4.1`, a loopback address that is usually trusted:
+the Pro WAF's CDN mode, PHP apps reading `$_SERVER['HTTP_X_FORWARDED_FOR']`,
+admin IP whitelists, login rate limits. Through Cloudflare Tunnel,
+`$remote_addr` is `127.0.0.1` as well, so nginx never sees the real client.
 
 ## What the plugin does
 
@@ -23,26 +25,39 @@ as well, so the WAF never sees the real client.
    `set_real_ip_from` for the trusted proxies only: the Cloudflare ranges,
    plus `127.0.0.1`/`::1` for cloudflared. It also sets
    `real_ip_header CF-Connecting-IP`. Nginx then puts the verified client
-   in `$remote_addr`. A direct visitor's spoofed header is ignored.
-2. Adds a Lua `rewrite_by_lua_block`. It runs before the WAF's access
-   phase and overwrites `X-Forwarded-For` and `X-Real-IP` with the
-   verified IP, so the WAF and the backend apps can't read the spoofed
-   value.
+   in `$remote_addr`, so aaPanel's IP allow/deny rules, `limit_req` and the
+   access logs see the real visitor. A direct visitor's spoofed header is ignored.
+2. Replaces `X-Forwarded-For` and `X-Real-IP` with the verified IP, using one
+   of two engines (picked automatically):
+   - **Lua engine**, when nginx has the Lua module: a `rewrite_by_lua_block`
+     that runs before the WAF and the app.
+   - **Native engine**, plain nginx, for aaPanel Free or any nginx without Lua:
+     - adds two `fastcgi_param` lines to `fastcgi.conf`, so PHP gets the
+       verified IP in `HTTP_X_FORWARDED_FOR` / `HTTP_X_REAL_IP`;
+     - includes `/www/server/nginx/conf/xff_guard_server.conf` in every site's
+       server block (marked `#XFF_GUARD`) to log or block spoofed requests.
 3. Logs (or blocks with 403) requests whose XFF contained a spoofed private or
-   loopback address. Tag in `nginx_error.log`: `[xff_guard]`.
-4. **WAF audit**: lists btwaf sites with "CDN" header mode on and can turn it
-   off. It backs up `site.json` to `plugin/xff_guard/backup/` first.
+   loopback address. Native engine: `/www/wwwlogs/xff_guard_spoof.log`.
+   Lua engine: lines tagged `[xff_guard]` in `nginx_error.log`.
+4. **Reverse-proxy sites**: configs using `$proxy_add_x_forwarded_for` pass
+   the spoofed chain to the backend. **Sanitize** swaps it for `$remote_addr`.
+5. **WAF audit (Pro only)**: lists btwaf sites with "CDN" header mode on and
+   can turn it off. Skipped automatically on aaPanel Free.
 
-Every change runs `nginx -t` before the reload. If the Lua guard conflicts
-with another http-level `rewrite_by_lua`, the plugin falls back to realip
-only. If the test still fails, it restores the previous file.
+Every change runs `nginx -t` before the reload, and anything it modifies is
+backed up to `plugin/xff_guard/backup/`. If a variant fails the test, the
+plugin tries the next one; if all fail, it restores the previous state.
+**Disable** and uninstalling undo every change.
 
 ## Install
 
 1. aaPanel → App Store → **Third-party** → **Import plugin** → upload `xff_guard.zip`.
 2. Open **XFF Guard**, choose **Cloudflare (proxy or Tunnel)**, and keep
    "Trust 127.0.0.1" ticked if you use cloudflared. Then click **Save & apply**.
-3. On the **WAF audit** tab, click **Turn off CDN header mode on all sites**.
+3. If **Reverse-proxy sites** shows a red badge, click **Sanitize**.
+4. Pro WAF only: on the **WAF audit** tab, click **Turn off CDN header mode on all sites**.
+5. Native engine: after adding a new site in aaPanel, click **Save & apply**
+   again so the new site gets the include too.
 
 ## Verify
 
@@ -50,8 +65,9 @@ only. If the test still fails, it restores the previous file.
 curl -s -H 'X-Forwarded-For: 127.4.4.1' https://www.example.com/.env -o /dev/null -w '%{http_code}\n'
 ```
 
-This should now be blocked by the WAF (or by XFF Guard, if set to Block).
-In the WAF log, the client IP should be your real IP, not `127.4.4.1`.
+With **Block** selected, this returns `403`. With **Log only**, it shows up
+on the **Spoof log** tab, and your access log and WAF log (Pro) show your real
+IP, not `127.4.4.1`.
 
 ## Troubleshooting
 

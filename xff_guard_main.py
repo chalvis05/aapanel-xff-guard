@@ -3,25 +3,30 @@
 # +-------------------------------------------------------------------
 # | XFF Guard - aaPanel third-party plugin
 # +-------------------------------------------------------------------
-# | Stops X-Forwarded-For spoofing from bypassing the Nginx WAF.
+# | Stops X-Forwarded-For spoofing. Works on aaPanel Free (no WAF) and
+# | with the Pro Nginx WAF (btwaf).
 # |
 # | The problem: a client sends "X-Forwarded-For: 127.4.4.1".
 # | Cloudflare *appends* the real IP, so the origin receives
-# | "X-Forwarded-For: 127.4.4.1,203.0.113.50". A WAF that trusts the
-# | left-most entry sees 127.4.4.1 (loopback = whitelisted) and lets
-# | the attack through.
+# | "X-Forwarded-For: 127.4.4.1,203.0.113.50". Anything that trusts the
+# | left-most entry (the Pro WAF, PHP apps, admin IP whitelists, rate
+# | limits) sees 127.4.4.1 (loopback = trusted) and lets the attack through.
 # |
 # | The fix:
 # |   1. ngx_http_realip_module: only trusted proxies (Cloudflare ranges,
 # |      and loopback for Cloudflare Tunnel) may change $remote_addr, and
 # |      only through CF-Connecting-IP (or a header you choose).
-# |   2. A Lua rewrite-phase guard that overwrites X-Forwarded-For and
-# |      X-Real-IP with the verified $remote_addr BEFORE the WAF's
-# |      access phase runs, so the WAF can never read a spoofed value.
+# |   2. X-Forwarded-For / X-Real-IP are replaced with the verified
+# |      $remote_addr before the WAF or the app can read them:
+# |        - "lua" engine: a rewrite_by_lua_block (needs nginx with Lua)
+# |        - "native" engine: plain nginx, no Lua and no WAF needed:
+# |          fastcgi.conf overrides the headers PHP sees, a per-site include
+# |          logs/blocks spoofed requests.
 # |   3. Optional: log or block requests that carried a spoofed
 # |      private/loopback address in X-Forwarded-For.
 # +-------------------------------------------------------------------
 import os
+import re
 import sys
 import json
 import time
@@ -44,10 +49,20 @@ CONFIG_FILE = os.path.join(PLUGIN_PATH, 'config.json')
 BACKUP_PATH = os.path.join(PLUGIN_PATH, 'backup')
 
 NGINX_BIN = '/www/server/nginx/sbin/nginx'
-NGINX_CONF = '/www/server/nginx/conf/nginx.conf'
+NGINX_CONF_DIR = '/www/server/nginx/conf'
+NGINX_CONF = NGINX_CONF_DIR + '/nginx.conf'
 # Files in this directory are included inside the http{} block by aaPanel.
 VHOST_NGINX = PANEL_PATH + '/vhost/nginx'
 GUARD_CONF = VHOST_NGINX + '/0.xff_guard.conf'
+PROXY_DIR = VHOST_NGINX + '/proxy'
+
+# Native engine pieces. Kept outside the plugin folder so a missing plugin
+# folder can never leave nginx pointing at a file that does not exist.
+SERVER_SNIPPET = NGINX_CONF_DIR + '/xff_guard_server.conf'
+FASTCGI_FILES = [NGINX_CONF_DIR + '/fastcgi.conf', NGINX_CONF_DIR + '/fastcgi_params']
+MARK = '#XFF_GUARD'
+SPOOF_LOG = '/www/wwwlogs/xff_guard_spoof.log'
+ERROR_LOG = '/www/wwwlogs/nginx_error.log'
 
 BTWAF_PATH = '/www/server/btwaf'
 BTWAF_SITE_JSON = BTWAF_PATH + '/site.json'
@@ -68,6 +83,10 @@ LOOPBACK = ['127.0.0.1', '::1']
 
 ALLOWED_HEADERS = ['CF-Connecting-IP', 'True-Client-IP', 'X-Real-IP', 'X-Forwarded-For']
 
+# Private, loopback, link-local and CGNAT addresses anywhere in X-Forwarded-For.
+SPOOF_REGEX = (r'(^|[,\s])(127\.|10\.|0\.|169\.254\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.'
+               r'|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|::1|f[cd][0-9a-f]*:|fe80:)')
+
 DEFAULT_CONFIG = {
     'enabled': False,
     'mode': 'cloudflare',          # cloudflare | custom | direct
@@ -77,7 +96,10 @@ DEFAULT_CONFIG = {
     'cf_ranges': CF_DEFAULT,
     'cf_updated': 0,
     'spoof_action': 'log',         # off | log | block
-    'lua_guard': True,
+    'lua_guard': True,             # prefer the Lua engine when nginx has Lua
+    'engine': '',                  # engine currently deployed: lua | native
+    'taken_over': [],
+    'proxy_patched': [],
     'last_apply': '',
     'last_result': '',
     'last_error': '',
@@ -110,7 +132,9 @@ def _write(path, body):
     tmp = path + '.tmp'
     with open(tmp, 'w') as f:
         f.write(body)
-    os.rename(tmp, path)
+    if os.path.exists(path):
+        shutil.copymode(path, tmp)
+    getattr(os, 'replace', os.rename)(tmp, path)
 
 
 def _valid_cidr(value):
@@ -120,6 +144,10 @@ def _valid_cidr(value):
         return True
     except Exception:
         return False
+
+
+def _strip_marked(body):
+    return ''.join(l for l in body.splitlines(True) if MARK not in l)
 
 
 class xff_guard_main:
@@ -189,6 +217,28 @@ class xff_guard_main:
             })
         return result
 
+    def __site_files(self):
+        """aaPanel site vhosts: http-level *.conf files that contain a server block."""
+        out = []
+        if not os.path.isdir(VHOST_NGINX):
+            return out
+        for f in sorted(os.listdir(VHOST_NGINX)):
+            path = os.path.join(VHOST_NGINX, f)
+            if not f.endswith('.conf') or path == GUARD_CONF or not os.path.isfile(path):
+                continue
+            body = _read(path) or ''
+            if re.search(r'^\s*server_name\b', body, re.M):
+                out.append(path)
+        return out
+
+    def __proxy_files(self):
+        """Config files that forward the client's own X-Forwarded-For chain to a backend."""
+        files = list(self.__site_files())
+        if os.path.isdir(PROXY_DIR):
+            for root, _, names in os.walk(PROXY_DIR):
+                files += [os.path.join(root, n) for n in names if n.endswith('.conf')]
+        return [f for f in files if '$proxy_add_x_forwarded_for' in (_read(f) or '')]
+
     # -------------------------------------------------------- conf rendering
     def __trusted(self, conf):
         if conf['mode'] == 'cloudflare':
@@ -230,7 +280,8 @@ rewrite_by_lua_block {
         end
         for ip in raw:gmatch("[^,%%s]+") do
             if ip ~= real and internal(ip) then
-                ngx.log(ngx.WARN, "[xff_guard] spoofed X-Forwarded-For '", raw,
+                -- CRIT: aaPanel's nginx.conf only writes "error_log ... crit" and above
+                ngx.log(ngx.CRIT, "[xff_guard] spoofed X-Forwarded-For '", raw,
                         "' from ", real, " ", ngx.var.request_method, " ", ngx.var.request_uri)
                 if action == "block" then
                     return ngx.exit(403)
@@ -245,11 +296,23 @@ rewrite_by_lua_block {
 }
 ''' % action
 
-    def __render(self, conf, with_lua, with_realip=True):
+    def __native_block(self):
+        return '''
+# Native engine (no Lua, no WAF): flags requests whose X-Forwarded-For
+# carries a private/loopback address. Used by %s,
+# which is included in every site's server block.
+map $http_x_forwarded_for $xff_guard_spoof {
+    default 0;
+    "~*%s" 1;
+}
+log_format xff_guard '$time_local $remote_addr "$http_x_forwarded_for" $host "$request" $status';
+''' % (SERVER_SNIPPET, SPOOF_REGEX)
+
+    def __render(self, conf, engine, with_realip=True):
         lines = [
             '# Managed by the XFF Guard aaPanel plugin. Do not edit by hand:',
             '# changes are overwritten on the next "Apply".',
-            '# Generated: ' + time.strftime('%Y-%m-%d %H:%M:%S'),
+            '# Generated: ' + time.strftime('%Y-%m-%d %H:%M:%S') + '  engine: ' + engine,
         ]
         trusted = self.__trusted(conf)
         if with_realip and conf['mode'] != 'direct' and trusted:
@@ -264,9 +327,53 @@ rewrite_by_lua_block {
             # recursive only matters for the multi-value X-Forwarded-For header:
             # it then walks right-to-left skipping trusted proxies, never trusting the left-most value.
             lines.append('real_ip_recursive %s;' % ('on' if header == 'X-Forwarded-For' else 'off'))
-        if with_lua:
+        if engine == 'lua':
             lines.append(self.__lua_block(conf))
+        else:
+            lines.append(self.__native_block())
         return '\n'.join(lines) + '\n'
+
+    def __render_snippet(self, conf):
+        action = conf.get('spoof_action', 'log')
+        lines = ['# Managed by XFF Guard. Included in each site server block.']
+        if action != 'off':
+            lines.append('access_log %s xff_guard if=$xff_guard_spoof;' % SPOOF_LOG)
+        if action == 'block':
+            lines.append('if ($xff_guard_spoof) { return 403; }')
+        return '\n'.join(lines) + '\n'
+
+    # ------------------------------------------------------- native engine
+    def __set_native(self, on, conf=None):
+        """Install or remove the per-site include and the fastcgi header override."""
+        for path in self.__site_files():
+            body = _read(path) or ''
+            new = _strip_marked(body)
+            if on:
+                new = re.sub(r'^([ \t]*)server_name\b[^\n]*$',
+                             lambda m: '%s\n%sinclude %s; %s' % (m.group(0), m.group(1), SERVER_SNIPPET, MARK),
+                             new, flags=re.M)
+            if new != body:
+                _write(path, new)
+
+        # PHP: an HTTP_* fastcgi_param replaces the client's request header,
+        # so $_SERVER['HTTP_X_FORWARDED_FOR'] becomes the verified address.
+        for path in FASTCGI_FILES:
+            body = _read(path)
+            if body is None:
+                continue
+            new = _strip_marked(body)
+            if on:
+                if not new.endswith('\n'):
+                    new += '\n'
+                new += ('fastcgi_param HTTP_X_FORWARDED_FOR $remote_addr; %s\n'
+                        'fastcgi_param HTTP_X_REAL_IP $remote_addr; %s\n') % (MARK, MARK)
+            if new != body:
+                _write(path, new)
+
+        if on:
+            _write(SERVER_SNIPPET, self.__render_snippet(conf))
+        elif os.path.exists(SERVER_SNIPPET):
+            os.remove(SERVER_SNIPPET)
 
     # ---------------------------------------------------------- nginx control
     def __nginx_test(self):
@@ -278,47 +385,61 @@ rewrite_by_lua_block {
             return _run('/etc/init.d/nginx reload')
         return _run('%s -s reload' % NGINX_BIN)
 
+    def __remove_guard(self):
+        self.__set_native(False)
+        if os.path.exists(GUARD_CONF):
+            os.remove(GUARD_CONF)
+
     def __deploy(self, conf):
         """
-        Write the guard file and test it. Tries, in order:
-          realip + Lua  ->  realip only  ->  Lua only (realip already declared elsewhere)
-        Rolls back to the previous file if every variant fails.
+        Write the guard and test it. Tries, in order:
+          Lua engine: realip + Lua   -> (falls through to native)
+          native:     realip + native
+          Lua only / native only (real_ip_* already declared elsewhere)
+        Restores the previous state if every variant fails.
         """
         old = _read(GUARD_CONF)
+        old_engine = conf.get('engine', '')
 
-        # If nginx is already broken without our file, say so instead of blaming the plugin.
-        if old is not None:
-            os.remove(GUARD_CONF)
+        def restore():
+            self.__remove_guard()
+            if old is not None:
+                if old_engine == 'native':
+                    self.__set_native(True, conf)
+                _write(GUARD_CONF, old)
+
+        # If nginx is already broken without our files, say so instead of blaming the plugin.
+        self.__remove_guard()
         ok, out = self.__nginx_test()
         if not ok:
-            if old is not None:
-                _write(GUARD_CONF, old)
+            restore()
             return False, ('nginx -t already fails WITHOUT XFF Guard, fix this first:\n' + out)
 
         info = self.__nginx_info()
         want_lua = bool(conf.get('lua_guard') and info['lua'])
         attempts = []
         if want_lua:
-            attempts.append((True, True, 'realip + Lua header guard'))
-        attempts.append((False, True, 'realip only'))
+            attempts.append(('lua', True, 'realip + Lua header guard'))
+        attempts.append(('native', True, 'realip + native header guard'))
         if want_lua:
-            attempts.append((True, False, 'Lua header guard only (real_ip_* is already set elsewhere)'))
+            attempts.append(('lua', False, 'Lua header guard only (real_ip_* is already set elsewhere)'))
+        attempts.append(('native', False, 'native header guard only (real_ip_* is already set elsewhere)'))
 
         errors = []
-        for with_lua, with_realip, note in attempts:
-            _write(GUARD_CONF, self.__render(conf, with_lua, with_realip))
+        for engine, with_realip, note in attempts:
+            self.__set_native(engine == 'native', conf)
+            _write(GUARD_CONF, self.__render(conf, engine, with_realip))
             ok, out = self.__nginx_test()
             if ok:
                 self.__nginx_reload()
-                if conf.get('lua_guard') and not with_lua:
-                    note += ' (Lua guard skipped: %s)' % ('nginx has no Lua module' if not info['lua']
-                                                          else 'conflicts with another http-level rewrite_by_lua')
+                conf['engine'] = engine
+                if engine == 'native':
+                    note += ' on %d site(s)' % len(self.__site_files())
+                    if conf.get('lua_guard') and not info['lua']:
+                        note += ' (nginx has no Lua module)'
                 return True, note
             errors.append('[%s]\n%s' % (note, out.strip()))
-        if old is None:
-            os.remove(GUARD_CONF)
-        else:
-            _write(GUARD_CONF, old)
+        restore()
         return False, '\n\n'.join(errors)
 
     # ============================================================ panel API
@@ -326,16 +447,21 @@ rewrite_by_lua_block {
         conf = self.__load()
         info = self.__nginx_info()
         sites = self.__btwaf_sites()
+        site_files = self.__site_files()
         return _ret(True, 'ok', {
             'config': conf,
             'nginx': info,
             'active': os.path.exists(GUARD_CONF),
             'conf_preview': _read(GUARD_CONF) or '',
+            'snippet_preview': _read(SERVER_SNIPPET) or '',
             'trusted_count': len(self.__trusted(conf)),
             'foreign_realip': self.__foreign_realip(),
             'btwaf_installed': os.path.isdir(BTWAF_PATH),
             'btwaf_sites': sites,
             'vulnerable_sites': [s['name'] for s in (sites or []) if s['cdn']],
+            'sites_total': len(site_files),
+            'sites_guarded': len([f for f in site_files if MARK in (_read(f) or '')]),
+            'proxy_spoofable': self.__proxy_files(),
         })
 
     def save_config(self, get):
@@ -394,9 +520,7 @@ rewrite_by_lua_block {
         conf['cf_updated'] = int(time.time())
         self.__save(conf)
         if conf['enabled']:
-            ok, note = self.__deploy(conf)
-            if not ok:
-                return _ret(False, 'Ranges updated but nginx test failed:\n' + note)
+            return self.apply(get)
         return _ret(True, 'Updated %d Cloudflare ranges' % len(nets))
 
     def apply(self, get):
@@ -452,6 +576,37 @@ rewrite_by_lua_block {
             return _ret(False, 'Restored %s because apply failed:\n%s' % (path, r['msg']))
         return _ret(True, 'Disabled %s and %s' % (os.path.basename(path), r['msg']))
 
+    def sanitize_proxy(self, get):
+        """
+        Reverse-proxy sites pass "$proxy_add_x_forwarded_for" to the backend, which is
+        the client's own (spoofable) X-Forwarded-For plus $remote_addr. Replace it with
+        the verified $remote_addr. Every file is backed up; "Disable" restores them.
+        """
+        files = self.__proxy_files()
+        if not files:
+            return _ret(True, 'No reverse-proxy config forwards a spoofable X-Forwarded-For')
+        dest = os.path.join(BACKUP_PATH, 'proxy')
+        if not os.path.isdir(dest):
+            os.makedirs(dest)
+        conf = self.__load()
+        patched = conf.get('proxy_patched', [])
+        done = []
+        stamp = time.strftime('%Y%m%d%H%M%S')
+        for path in files:
+            backup = os.path.join(dest, '%s.%s' % (re.sub(r'[^\w.-]+', '_', path.strip('/')), stamp))
+            shutil.copy2(path, backup)
+            _write(path, (_read(path) or '').replace('$proxy_add_x_forwarded_for', '$remote_addr'))
+            done.append({'file': path, 'backup': backup})
+        ok, out = self.__nginx_test()
+        if not ok:
+            for item in done:
+                shutil.copy2(item['backup'], item['file'])
+            return _ret(False, 'nginx -t failed, reverse-proxy configs restored:\n' + out)
+        conf['proxy_patched'] = patched + done
+        self.__save(conf)
+        self.__nginx_reload()
+        return _ret(True, 'Sanitized %d reverse-proxy config(s)' % len(done))
+
     def __restore_taken(self, conf):
         restored = []
         for path in conf.get('taken_over', []):
@@ -461,16 +616,30 @@ rewrite_by_lua_block {
         conf['taken_over'] = []
         return restored
 
+    def __restore_proxy(self, conf):
+        restored = []
+        # oldest backup per file wins: it is the original, pre-plugin version
+        seen = set()
+        for item in conf.get('proxy_patched', []):
+            if item['file'] in seen or not os.path.exists(item['backup']):
+                continue
+            seen.add(item['file'])
+            # the backup may hold native-engine include lines, which were removed with the guard
+            _write(item['file'], _strip_marked(_read(item['backup']) or ''))
+            restored.append(os.path.basename(item['file']))
+        conf['proxy_patched'] = []
+        return restored
+
     def disable(self, get):
         conf = self.__load()
         conf['enabled'] = False
-        restored = self.__restore_taken(conf)
+        conf['engine'] = ''
+        self.__remove_guard()
+        restored = self.__restore_taken(conf) + self.__restore_proxy(conf)
         self.__save(conf)
-        if os.path.exists(GUARD_CONF):
-            os.remove(GUARD_CONF)
         ok, out = self.__nginx_test()
         if not ok:
-            return _ret(False, 'Removed guard file but nginx -t failed:\n' + out)
+            return _ret(False, 'Removed XFF Guard but nginx -t failed:\n' + out)
         self.__nginx_reload()
         msg = 'Protection disabled'
         if restored:
@@ -479,10 +648,10 @@ rewrite_by_lua_block {
 
     def fix_btwaf(self, get):
         """
-        btwaf 'CDN mode' reads the left-most X-Forwarded-For value as the client IP,
-        which is exactly what the attacker controls. With realip active, $remote_addr
-        is already the verified client, so CDN mode is turned off for every site.
-        A timestamped backup of site.json is kept in the plugin folder.
+        Pro Nginx WAF only. btwaf 'CDN mode' reads the left-most X-Forwarded-For value
+        as the client IP, which is exactly what the attacker controls. With realip active,
+        $remote_addr is already the verified client, so CDN mode is turned off for every
+        site. A timestamped backup of site.json is kept in the plugin folder.
         """
         if not os.path.exists(GUARD_CONF):
             return _ret(False, 'Enable protection first, otherwise the WAF would see the proxy IP')
@@ -509,13 +678,23 @@ rewrite_by_lua_block {
         return _ret(True, 'Disabled CDN header mode for: %s (backup: %s)' % (', '.join(changed), backup))
 
     def get_logs(self, get):
-        log = '/www/wwwlogs/nginx_error.log'
-        if not os.path.exists(log):
-            return _ret(True, 'ok', [])
-        _, out = _run("tail -n 5000 %s | grep '\\[xff_guard\\]' | tail -n 100" % log)
-        return _ret(True, 'ok', [l for l in out.splitlines() if l.strip()][::-1])
+        lines = []
+        if os.path.exists(SPOOF_LOG):
+            _, out = _run('tail -n 100 %s' % SPOOF_LOG)
+            lines += [l for l in out.splitlines() if l.strip()]
+        if os.path.exists(ERROR_LOG):
+            _, out = _run("tail -n 5000 %s | grep '\\[xff_guard\\]' | tail -n 100" % ERROR_LOG)
+            lines += [l for l in out.splitlines() if l.strip()]
+        return _ret(True, 'ok', lines[::-1])
 
     def preview(self, get):
         conf = self.__load()
         info = self.__nginx_info()
-        return _ret(True, 'ok', self.__render(conf, bool(conf.get('lua_guard') and info['lua'])))
+        engine = 'lua' if (conf.get('lua_guard') and info['lua']) else 'native'
+        return _ret(True, 'ok', self.__render(conf, engine))
+
+
+if __name__ == '__main__':
+    # install.sh calls this on uninstall so every file the plugin touched is restored
+    if len(sys.argv) > 1 and sys.argv[1] == 'uninstall':
+        print(xff_guard_main().disable(None)['msg'])

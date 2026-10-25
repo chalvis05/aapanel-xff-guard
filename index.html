@@ -17,7 +17,7 @@
 <div id="xffg">
     <div class="tabs">
         <span class="act" data-p="p-main">Protection</span>
-        <span data-p="p-waf">WAF audit</span>
+        <span data-p="p-waf">WAF audit (Pro)</span>
         <span data-p="p-conf">Nginx config</span>
         <span data-p="p-log">Spoof log</span>
     </div>
@@ -26,6 +26,10 @@
         <div id="xffg-warn"></div>
         <div class="row"><label class="k">Status</label><span id="xffg-state"></span><span class="tip" id="xffg-last"></span></div>
         <div class="row"><label class="k">Nginx</label><span id="xffg-nginx"></span></div>
+        <div class="row"><label class="k">Edition</label><span id="xffg-edition"></span></div>
+        <div class="row"><label class="k">Engine</label><span id="xffg-engine"></span></div>
+        <div class="row"><label class="k">Sites covered</label><span id="xffg-sites"></span></div>
+        <div class="row"><label class="k">Reverse-proxy sites</label><span id="xffg-proxyfix"></span></div>
 
         <h3>Where does traffic come from?</h3>
         <div class="row"><label class="k">Proxy mode</label>
@@ -51,9 +55,9 @@
         </div>
 
         <h3>Header guard</h3>
-        <div class="row"><label class="k">Rewrite XFF before WAF</label>
+        <div class="row"><label class="k">Prefer Lua engine</label>
             <input type="checkbox" id="xffg-lua">
-            <span class="tip">Replaces X-Forwarded-For / X-Real-IP with the verified IP (needs Lua)</span>
+            <span class="tip">Uses Lua when nginx has it; otherwise the native engine (works on aaPanel Free, no WAF needed)</span>
         </div>
         <div class="row"><label class="k">Spoofed private IP in XFF</label>
             <select id="xffg-action" class="bt-input-text">
@@ -78,16 +82,22 @@
            which the attacker controls (<code>127.4.4.1,203.0.113.50</code> → <code>127.4.4.1</code>).
            With XFF Guard active, nginx already knows the real IP, so CDN mode should be off.</p>
         <div id="xffg-waf"></div>
-        <button class="btn btn-success btn-sm" style="margin-top:10px" onclick="xffg.call('fix_btwaf')">Turn off CDN header mode on all sites</button>
+        <button class="btn btn-success btn-sm" id="xffg-wafbtn" style="margin-top:10px" onclick="xffg.call('fix_btwaf')">Turn off CDN header mode on all sites</button>
     </div>
 
     <div class="pane" id="p-conf">
         <p>Written to <code>/www/server/panel/vhost/nginx/0.xff_guard.conf</code> (http level).</p>
         <pre id="xffg-conf"></pre>
+        <div id="xffg-snippet-wrap">
+            <p>Native engine: <code>/www/server/nginx/conf/xff_guard_server.conf</code>, included in every site's
+               server block. <code>fastcgi.conf</code> also gets two lines that hand PHP the verified IP.</p>
+            <pre id="xffg-snippet"></pre>
+        </div>
     </div>
 
     <div class="pane" id="p-log">
-        <p>Spoof attempts from <code>/www/wwwlogs/nginx_error.log</code> (newest first).
+        <p>Spoof attempts from <code>/www/wwwlogs/xff_guard_spoof.log</code> (native engine) and
+           <code>/www/wwwlogs/nginx_error.log</code> (Lua engine), newest first.
            <button class="btn btn-default btn-xs" onclick="xffg.logs()">Refresh</button></p>
         <pre id="xffg-log">-</pre>
     </div>
@@ -133,6 +143,24 @@ var xffg = {
             $('#xffg-cf').text((c.cf_ranges || []).length + ' ranges' +
                 (c.cf_updated ? ', updated ' + new Date(c.cf_updated * 1000).toLocaleString() : ' (built-in list)'));
             $('#xffg-conf').text(d.conf_preview || '(not written yet)');
+            $('#xffg-snippet').text(d.snippet_preview);
+            $('#xffg-snippet-wrap').toggle(!!d.snippet_preview);
+
+            $('#xffg-edition').html(d.btwaf_installed ? 'Pro Nginx WAF detected' :
+                'Free (no Nginx WAF) &nbsp;<span class="tip">fully supported: protects PHP apps, IP allow/deny rules, rate limits and logs</span>');
+            var eng = { lua: 'Lua (rewrite_by_lua)', native: 'Native nginx (no Lua, no WAF needed)' };
+            $('#xffg-engine').html(c.engine ? xffg.esc(eng[c.engine] || c.engine) :
+                '<span class="tip">Will use ' + (c.lua_guard && n.lua ? eng.lua : eng.native) + '</span>');
+            $('#xffg-sites').html(c.engine === 'native' ?
+                (d.sites_guarded < d.sites_total
+                    ? '<b style="color:#e74c3c">' + d.sites_guarded + ' / ' + d.sites_total + '</b> <span class="tip">New site added? Click Save &amp; apply to cover it.</span>'
+                    : d.sites_guarded + ' / ' + d.sites_total) :
+                (c.engine === 'lua' ? 'All (http level)' : '-'));
+            $('#xffg-proxyfix').html(d.proxy_spoofable.length
+                ? '<span class="badge bad">' + d.proxy_spoofable.length + ' forward a spoofable XFF</span> ' +
+                  '<button class="btn btn-success btn-xs" onclick="xffg.call(\'sanitize_proxy\')">Sanitize</button>' +
+                  ' <span class="tip">Backed up; Disable restores them</span>'
+                : '<span class="badge on">OK</span>');
 
             var w = '';
             if (d.vulnerable_sites.length)
@@ -154,7 +182,9 @@ var xffg = {
             $('#xffg-warn').html(w);
 
             var t;
-            if (!d.btwaf_installed) t = '<p>aaPanel Nginx WAF (btwaf) not found.</p>';
+            $('#xffg-wafbtn').toggle(!!d.btwaf_sites);
+            if (!d.btwaf_installed) t = '<p><b>Nginx WAF (Pro) is not installed: nothing to do here.</b> On aaPanel Free, ' +
+                'XFF Guard alone fixes the client IP for PHP apps, IP allow/deny rules, rate limits and logs.</p>';
             else if (!d.btwaf_sites) t = '<p>Could not read /www/server/btwaf/site.json.</p>';
             else {
                 t = '<table class="table table-hover"><thead><tr><th>Site</th><th>CDN header mode</th><th>Headers read</th></tr></thead><tbody>';
